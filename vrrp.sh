@@ -22,11 +22,12 @@ log() {
 
 usage() {
     cat <<EOF
-Usage: $0 {create|delete|status}
+Usage: $0 {create|delete|status|validate}
 
-  create  - Parse JSON and set up VxLAN + VRRP (keepalived) on this node
-  delete  - Tear down VxLAN + VRRP created by this config
-  status  - Show VxLAN + VRRP status
+  create    - Parse JSON and set up VxLAN + VRRP (keepalived) on this node
+  delete    - Tear down VxLAN + VRRP created by this config
+  status    - Show VxLAN + VRRP status
+  validate  - Validate JSON, resolve local node via tun0, and run connectivity checks only
 
 Config JSON: $CONF_JSON
 EOF
@@ -51,8 +52,9 @@ ensure_config_exists() {
 }
 
 get_local_wan_ip() {
-    # Best-effort: pick any non-loopback, non-link-local IPv4 to match with Nodes[].WAN_IP
-    ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -n1
+    # In this deployment, "WAN_IP" in JSON is the overlay IP on tun0.
+    # We explicitly read tun0's IPv4 address.
+    ip -4 -o addr show dev tun0 scope global | awk '{print $4}' | cut -d/ -f1 | head -n1
 }
 
 find_iface_by_ip() {
@@ -80,7 +82,7 @@ find_local_node_index() {
     NODE_INDEX=$(jq -r --arg ip "$local_ip" '.vrrp.Nodes | to_entries[] | select(.value.WAN_IP == $ip) | .key' "$CONF_JSON" || true)
 
     if [[ -z "$NODE_INDEX" ]]; then
-        log "Error: local WAN IP $local_ip not found in vrrp.Nodes[].WAN_IP"
+        log "Error: local WAN (tun0) IP $local_ip not found in vrrp.Nodes[].WAN_IP"
         exit 3
     fi
 }
@@ -106,10 +108,11 @@ extract_node_values() {
 create_vxlan_and_bridge() {
     log "Configuring VxLAN interface $VX_IFACE for local node (WAN_IP=$NODE_WAN_IP, remote=$NODE_REMOTE_IP)"
 
+    # Use the interface that has NODE_WAN_IP (tun0 in this design)
     local wan_dev
     wan_dev=$(find_iface_by_ip "$NODE_WAN_IP")
     if [[ -z "$wan_dev" ]]; then
-        log "Error: unable to find interface for local WAN IP $NODE_WAN_IP"
+        log "Error: unable to find interface for local WAN (tun0) IP $NODE_WAN_IP"
         exit 2
     fi
 
@@ -196,11 +199,11 @@ verify_connectivity() {
 
     log "Running connectivity checks..."
 
-    # 1) Check reachability to remote WAN_IP (node-to-node)
+    # 1) Check reachability to remote WAN_IP (overlay, tun0 peer)
     if ping -c 3 -W 2 "$NODE_REMOTE_IP" >/dev/null 2>&1; then
-        log "OK: remote WAN_IP $NODE_REMOTE_IP reachable"
+        log "OK: remote WAN (tun0) IP $NODE_REMOTE_IP reachable"
     else
-        log "ERROR: cannot ping remote WAN_IP $NODE_REMOTE_IP"
+        log "ERROR: cannot ping remote WAN (tun0) IP $NODE_REMOTE_IP"
         errors=1
     fi
 
@@ -224,7 +227,7 @@ delete_vxlan_and_ip() {
     local local_ip
     local_ip=$(get_local_wan_ip)
     if [[ -z "$local_ip" ]]; then
-        log "Warning: cannot determine local WAN IP; skipping VxLAN delete"
+        log "Warning: cannot determine local WAN (tun0) IP; skipping VxLAN delete"
         return 0
     fi
 
@@ -255,10 +258,10 @@ cmd_create() {
     local local_ip
     local_ip=$(get_local_wan_ip)
     if [[ -z "$local_ip" ]]; then
-        log "Error: cannot determine local WAN IP"
+        log "Error: cannot determine local WAN (tun0) IP"
         exit 2
     fi
-    log "Local detected IP: $local_ip"
+    log "Local detected WAN (tun0) IP: $local_ip"
 
     extract_common_values
     find_local_node_index "$local_ip"
@@ -326,6 +329,33 @@ cmd_status() {
     exit 0
 }
 
+cmd_validate() {
+    # Validate JSON + mapping + connectivity only. No config changes.
+    check_deps
+    ensure_config_exists
+
+    local local_ip
+    local_ip=$(get_local_wan_ip)
+    if [[ -z "$local_ip" ]]; then
+        log "Error: cannot determine local WAN (tun0) IP"
+        exit 2
+    fi
+    log "Validation: local detected WAN (tun0) IP: $local_ip"
+
+    extract_common_values
+    find_local_node_index "$local_ip"
+    extract_node_values
+
+    log "Validation: resolved node index=$NODE_INDEX siteID=$NODE_SITE_ID"
+    log "Validation: peer (Remote_IP)=$NODE_REMOTE_IP, Tunnel_IP=$NODE_TUNNEL_IP, VNI=$NODE_VNI, Interface=$NODE_IFACE"
+
+    # Only connectivity checks; does NOT touch VxLAN or keepalived.
+    verify_connectivity
+
+    log "Validation successful"
+    exit 0
+}
+
 main() {
     if [[ $# -lt 1 ]]; then
         usage
@@ -341,6 +371,9 @@ main() {
             ;;
         status)
             cmd_status
+            ;;
+        validate)
+            cmd_validate
             ;;
         *)
             usage
